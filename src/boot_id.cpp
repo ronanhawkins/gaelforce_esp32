@@ -1,6 +1,7 @@
 #include "boot_id.hpp"
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -23,11 +24,23 @@ uint16_t next() {
     nvs_handle_t h;
     ESP_ERROR_CHECK(nvs_open(kNamespace, NVS_READWRITE, &h));
 
+    // NOT_FOUND is the first boot ever: 0 here, 1 out, and the count starts.
     uint16_t id = 0;
     err = nvs_get_u16(h, kKey, &id);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(kTag, "read failed (%s), restarting the count", esp_err_to_name(err));
-        id = 0;
+        uint8_t mac[6] = {};
+        const esp_err_t macErr = esp_efuse_mac_get_default(mac);
+        if (macErr == ESP_OK) {
+            id = static_cast<uint16_t>((mac[4] << 8) | mac[5]);
+            ESP_LOGW(kTag, "read failed (%s), reseeding from MAC to %u",
+                     esp_err_to_name(err), id);
+        } else {
+            // Nothing left to seed from. Restarting the count is wrong, and
+            // known to be wrong, but it still beats refusing to boot.
+            id = 0;
+            ESP_LOGE(kTag, "read failed (%s) and MAC unavailable (%s), restarting the count",
+                     esp_err_to_name(err), esp_err_to_name(macErr));
+        }
     }
 
     ++id;
