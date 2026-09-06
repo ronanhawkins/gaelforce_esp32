@@ -1,0 +1,23 @@
+# N8R8 module: 8MB flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# LOAD-BEARING for the 100Hz loop.
+#
+# At the default 100Hz tick, pdMS_TO_TICKS(10) is exactly ONE tick, so
+# vTaskDelayUntil can only ever land on 10ms boundaries and any jitter
+# measurement reports a flawless loop by construction. At 1000Hz the delay is
+# 10 ticks and the instrumentation can actually see drift.
+CONFIG_FREERTOS_HZ=1000
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=43
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=44
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
+# No PSRAM. The particle filter is ~19KB and belongs in internal SRAM, which is faster.
+CONFIG_SPIRAM=n
