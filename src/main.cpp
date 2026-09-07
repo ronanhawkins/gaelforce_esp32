@@ -10,9 +10,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "gflib/link.hpp"
+#include "gflib/mcl.hpp"
 #include "gflib/posesource.hpp"
 #include "hal_esp32.hpp"
 #include "pod_config.hpp"
+#include "tof_array.hpp"
 
 namespace {
 
@@ -28,6 +30,22 @@ hal::RvcImu g_imu(UART_NUM_1, cfg::kImuRxPin);
 hal::Rs485Stream g_link(UART_NUM_2, cfg::kRs485TxPin, cfg::kRs485RxPin, cfg::kRs485DePin);
 
 gflib::OdomPoseSource g_odom(g_vert, g_horiz, g_imu, g_clock, cfg::makeOdom());
+
+// MCL cloud and correcting sensors.
+gflib::Mcl g_mcl;
+tof::TofArray g_tof;
+
+// State for rate-limited divergence recovery.
+uint32_t g_lastReseedMs = 0;
+uint32_t g_mclReseeds = 0;
+bool g_haveReseeded = false;
+
+// Separate MCL and I2C timing statistics.
+int64_t g_mclMaxUs = 0;
+int64_t g_mclSumUs = 0;
+int64_t g_tofMaxUs = 0;
+int64_t g_tofSumUs = 0;
+uint32_t g_mclTicks = 0;
 
 gflib::FrameWriter g_writer;
 gflib::FrameParser g_parser;
@@ -122,6 +140,10 @@ bool drainParser(uint32_t nowMs) {
                     p.thetaDeg = ps.thetaDegrees;
 
                     g_odom.setPose(p);
+
+                    // Keep the cloud aligned with the odometry reset.
+                    g_mcl.reseed(p, cfg::kMclSeedPosSigmaIn, cfg::kMclSeedHeadingSigmaDeg);
+
                     g_poseResetPending = true;
 
                     ESP_LOGI(kTag, "PoseSet -> %.2f %.2f %.2f", ps.xInches, ps.yInches,
@@ -136,7 +158,7 @@ bool drainParser(uint32_t nowMs) {
     return sawStatus;
 }
 
-uint16_t buildFlags(uint32_t nowMs) {
+uint16_t buildFlags(uint32_t nowMs, double confidence) {
     uint16_t f = 0;
 
     if (g_imu.ok(nowMs)) f |= gflib::PoseFlags::kImuOk;
@@ -157,12 +179,16 @@ uint16_t buildFlags(uint32_t nowMs) {
     // sees this echo
     if (g_poseResetPending) f |= gflib::PoseFlags::kPoseReset;
 
-    // kMclConverged stays clear until Stage C. Confidence is 1 because dead
+    // Reuse the filter's gating-confidence threshold.
+    if (!g_mcl.diverged() && confidence >= g_mcl.config().gateMinConfidence) {
+        f |= gflib::PoseFlags::kMclConverged;
+    }
+
     return f;
 }
 
 // Returns the moment the frame was handed to the UART, or 0 if none was.
-int64_t report(uint32_t nowMs, uint16_t flags) {
+int64_t report(uint32_t nowMs, uint16_t flags, const gflib::Pose& mcl, double confidence) {
     const gflib::Pose p = g_odom.getPose();
     const gflib::Velocity v = g_odom.getVelocity();
 
@@ -171,20 +197,21 @@ int64_t report(uint32_t nowMs, uint16_t flags) {
     // The sender's clock, captured before the sensors were read
     rep.timestampMs = nowMs;
 
-    rep.xInches = p.x;
-    rep.yInches = p.y;
-    rep.thetaDegrees = p.thetaDeg;
-    rep.confidence = 1.0f;
+    rep.xInches = static_cast<float>(mcl.x);
+    rep.yInches = static_cast<float>(mcl.y);
+    rep.thetaDegrees = static_cast<float>(mcl.thetaDeg);
+    rep.confidence = static_cast<float>(confidence);
     rep.flags = flags;
 
-    rep.odomXInches = p.x;
-    rep.odomYInches = p.y;
-    rep.odomThetaDegrees = p.thetaDeg;
+    rep.odomXInches = static_cast<float>(p.x);
+    rep.odomYInches = static_cast<float>(p.y);
+    rep.odomThetaDegrees = static_cast<float>(p.thetaDeg);
 
     rep.bootId = g_bootId;
-    rep.vxInchesPerSec = v.vx;
-    rep.vyInchesPerSec = v.vy;
-    rep.omegaDegPerSec = v.omegaDegPerSec;
+    // MCL resampling makes pose-derived velocity unstable.
+    rep.vxInchesPerSec = static_cast<float>(v.vx);
+    rep.vyInchesPerSec = static_cast<float>(v.vy);
+    rep.omegaDegPerSec = static_cast<float>(v.omegaDegPerSec);
 
     uint8_t frame[gflib::kLinkMaxFrame];
     const size_t n = g_writer.poseReport(rep, frame, sizeof(frame));
@@ -228,11 +255,11 @@ void drainPending(uint32_t nowMs) {
 
 // Spends the tick's slack listening instead of sleeping. Returns when the
 // reply has been decoded or the window closes
-void listen(uint32_t nowMs, int64_t txStartUs) {
+void listen(uint32_t nowMs, int64_t txStartUs, int64_t windowUs) {
     // A dropped send provokes no reply, so the window still runs
     const bool timing = txStartUs != 0;
     const int64_t windowStartUs = timing ? txStartUs : esp_timer_get_time();
-    const int64_t deadlineUs = windowStartUs + cfg::kRxWindowUs;
+    const int64_t deadlineUs = windowStartUs + windowUs;
     uint8_t chunk[128];
 
     for (;;) {
@@ -313,6 +340,57 @@ void telemetry() {
 
     if (g_droppedSends > 0) ESP_LOGW(kTag, "dropped sends %" PRIu32, g_droppedSends);
 
+    // MCL pose, spread, and divergence diagnostics.
+    const gflib::Pose m = g_mcl.estimate();
+    ESP_LOGI(kTag,
+             "mcl %.2f %.2f %.2f | conf %.2f spread %.2f hdg-sd %.2f ess %.0f/%d"
+             " | gated %" PRIu32 " diverged %" PRIu32 " reseeds %" PRIu32 "%s",
+             m.x, m.y, m.thetaDeg, g_mcl.confidence(), g_mcl.positionStdDevInches(),
+             g_mcl.headingStdDevDeg(), g_mcl.effectiveSampleSize(), g_mcl.particleCount(),
+             g_mcl.gatedReadings(), g_mcl.divergences(), g_mclReseeds,
+             g_mcl.diverged() ? " DIVERGED" : "");
+
+    if (g_mclTicks > 0) {
+        ESP_LOGI(kTag,
+                 "cost mcl %.2f/%.2f ms | tof i2c %.2f/%.2f ms  mean/max over %" PRIu32
+                 " ticks (%d particles)",
+                 (static_cast<double>(g_mclSumUs) / g_mclTicks) / 1000.0, g_mclMaxUs / 1000.0,
+                 (static_cast<double>(g_tofSumUs) / g_mclTicks) / 1000.0, g_tofMaxUs / 1000.0,
+                 g_mclTicks, g_mcl.particleCount());
+    }
+    g_mclMaxUs = 0;
+    g_mclSumUs = 0;
+    g_tofMaxUs = 0;
+    g_tofSumUs = 0;
+    g_mclTicks = 0;
+
+    // Per-sensor ToF diagnostics expose mount errors.
+    static const char* kRejectName[] = {"ok", "absent", "noret", "range",
+                                        "disp", "obliq", "motion"};
+    for (int i = 0; i < cfg::kTofCount; ++i) {
+        const tof::SensorStatus& t = g_tof.status(i);
+        if (!t.present) {
+            ESP_LOGW(kTag, "tof%d ABSENT (never enumerated)", i);
+            continue;
+        }
+        ESP_LOGI(kTag,
+                 "tof%d @0x%02X cal 0x%02X t1st %" PRIu32 " ms | zones %4u/%3u %4u/%3u %4u/%3u %4u/%3u mm/conf"
+                 " | med %6.2f in %s | n %" PRIu32 " ok %" PRIu32
+                 " noret %" PRIu32 " range %" PRIu32 " disp %" PRIu32
+                 " obliq %" PRIu32 " motion %" PRIu32 " nogate %" PRIu32 " bus %" PRIu32,
+                 i, t.address, t.calibrationStatus, t.firstResultMs,
+                 t.lastZoneMm[0], t.lastZoneConf[0], t.lastZoneMm[1], t.lastZoneConf[1],
+                 t.lastZoneMm[2], t.lastZoneConf[2], t.lastZoneMm[3], t.lastZoneConf[3],
+                 t.lastMedianInches, kRejectName[static_cast<int>(t.lastReject)],
+                 t.results, t.accepted,
+                 t.rejects[static_cast<int>(tof::Reject::NoReturn)],
+                 t.rejects[static_cast<int>(tof::Reject::OutOfRange)],
+                 t.rejects[static_cast<int>(tof::Reject::Dispersion)],
+                 t.rejects[static_cast<int>(tof::Reject::Oblique)],
+                 t.rejects[static_cast<int>(tof::Reject::Motion)],
+                 t.incidenceUncomputable, t.busErrors);
+    }
+
     g_loop.reset();
     g_rtt.reset();
 }
@@ -320,6 +398,9 @@ void telemetry() {
 }  // namespace
 
 extern "C" void app_main(void) {
+    // Hold every sensor low before creating the shared I2C bus.
+    ESP_ERROR_CHECK(g_tof.holdAllInReset());
+
     g_bootId = bootid::next();
     ESP_LOGI(kTag, "gaelforce pod, bootId %u, link %" PRIu32 " baud", g_bootId,
              gflib::kLinkBaud);
@@ -345,7 +426,21 @@ extern "C" void app_main(void) {
     // Seeds the sensor baselines from the robot as it stands.
     g_odom.begin(0);
 
-    ESP_LOGI(kTag, "ready");
+    // Missing sensors degrade operation but are not fatal.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(g_tof.begin());
+
+    // Seed from odometry; bootId makes the RNG seed reproducible.
+    const gflib::MclConfig mclCfg = cfg::makeMcl();
+    g_mcl.init(mclCfg, g_odom.getPose(), cfg::kMclSeedPosSigmaIn,
+               cfg::kMclSeedHeadingSigmaDeg, g_bootId);
+
+    // Warn every boot until the interior field size is confirmed.
+    ESP_LOGW(kTag,
+             "field interior %.1f x %.1f in (PLACEHOLDER -- confirm against the "
+             "game manual and a tape measure)",
+             2.0 * mclCfg.fieldHalfWidthInches, 2.0 * mclCfg.fieldHalfHeightInches);
+
+    ESP_LOGI(kTag, "ready, %d/%d tof sensors", g_tof.presentCount(), cfg::kTofCount);
 
     TickType_t last = xTaskGetTickCount();
     int64_t prevTickUs = esp_timer_get_time();
@@ -368,13 +463,68 @@ extern "C" void app_main(void) {
 
         g_odom.update();
 
-        const uint16_t flags = buildFlags(nowMs);
+        // Predict from the deltas odometry actually accepted.
+        const int64_t mclStartUs = esp_timer_get_time();
 
-        const int64_t txStartUs = report(nowMs, flags);
+        const gflib::OdomPoseSource::IntegratedDeltas d = g_odom.lastDeltas();
+        g_mcl.predict(d.vertCounts, d.horizCounts, d.thetaDeg, g_odom.config().odom);
 
-        // The Brain replies on decoding that frame, so the wire is quiet
-        // until roughly 3-5ms from now. Listen through
-        listen(nowMs, txStartUs);
+        // Traverse the cloud once for gating, flags, and reporting.
+        const gflib::Pose mclPose = g_mcl.estimate();
+        const double confidence = g_mcl.confidence();
+
+        tof::GateContext gate;
+        gate.estimate = mclPose;
+        gate.confidence = static_cast<gflib::real>(confidence);
+        gate.omegaDegPerSec = g_odom.getVelocity().omegaDegPerSec;
+
+        // Treat stale drive voltage as unknown; yaw remains measured.
+        const bool statusFresh =
+            g_haveStatus && !gflib::linkIsStale(nowMs, g_statusMs, cfg::kBrainStatusTimeoutMs);
+        if (statusFresh) {
+            const double l = std::fabs(g_status.leftVolts);
+            const double r = std::fabs(g_status.rightVolts);
+            gate.driveVolts = static_cast<float>(l > r ? l : r);
+            gate.brainInhibits =
+                (g_status.flags & (gflib::BrainFlags::kDisabled | gflib::BrainFlags::kEstop)) != 0;
+        }
+
+        const int64_t mclPredictUs = esp_timer_get_time() - mclStartUs;
+
+        // Poll one sensor per tick and time I2C separately.
+        const int64_t tofStartUs = esp_timer_get_time();
+        const gflib::SensorReading* fresh = g_tof.poll(gate);
+        const int64_t tofUs = esp_timer_get_time() - tofStartUs;
+
+        const int64_t mclResumeUs = esp_timer_get_time();
+        if (fresh != nullptr) {
+            g_mcl.update(cfg::kTofMounts, cfg::kTofCount, fresh, 1);
+        }
+
+        // Recover latched divergence from odometry, with rate limiting.
+        if (g_mcl.diverged() &&
+            (!g_haveReseeded ||
+             gflib::linkElapsedMs(nowMs, g_lastReseedMs) >= cfg::kMclReseedMinIntervalMs)) {
+            g_mcl.reseed(g_odom.getPose(), cfg::kMclSeedPosSigmaIn,
+                         cfg::kMclSeedHeadingSigmaDeg);
+            g_lastReseedMs = nowMs;
+            g_haveReseeded = true;
+            ++g_mclReseeds;
+        }
+
+        const int64_t mclUs = mclPredictUs + (esp_timer_get_time() - mclResumeUs);
+        if (mclUs > g_mclMaxUs) g_mclMaxUs = mclUs;
+        if (tofUs > g_tofMaxUs) g_tofMaxUs = tofUs;
+        g_mclSumUs += mclUs;
+        g_tofSumUs += tofUs;
+        ++g_mclTicks;
+
+        const uint16_t flags = buildFlags(nowMs, confidence);
+
+        const int64_t txStartUs = report(nowMs, flags, mclPose, confidence);
+
+        // Use a short window when no fresh Brain reply is expected.
+        listen(nowMs, txStartUs, statusFresh ? cfg::kRxWindowUs : cfg::kRxWindowIdleUs);
 
         g_loop.addWork(esp_timer_get_time() - tickUs);
 
