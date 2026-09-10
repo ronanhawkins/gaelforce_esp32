@@ -20,30 +20,33 @@ using gflib::operator""_r;
 // bonds those whether or not the software enables PSRAM -- and 48 the RGB LED.
 // 43/44 are the console UART. That leaves 1-18, 21, 38-42.
 
-// Quadrature pods, through the SN74LVC244A. The 244 drives actively, so the
+// Quadrature pods, through the SN74LVC245A. The 245 drives actively, so the
 // PCNT channels' default pull-ups are along for the ride and harmless.
-constexpr int kVertEncAPin  = 4;
-constexpr int kVertEncBPin  = 5;
-constexpr int kHorizEncAPin = 6;
-constexpr int kHorizEncBPin = 7;
+constexpr int kVertEncAPin  = 1;
+constexpr int kVertEncBPin  = 2;
+constexpr int kHorizEncAPin = 4;
+constexpr int kHorizEncBPin = 5;
 
 // BNO085 UART-RVC. RX only: RVC is one-way and the part accepts nothing back.
 // The P0 jumper on the breakout must be bridged or it comes up in I2C mode
 // and this pin stays silent forever -- indistinguishable from a broken wire.
 constexpr int kImuRxPin = 8;
 
-// MAX3485. DE and RE are tied together and driven as UART RTS, which lets
+// SP3485. DE and RE are tied together and driven as UART RTS, which lets
 // uart_set_mode(UART_MODE_RS485_HALF_DUPLEX) handle the turnaround in
 // hardware. Doing it from software is the classic RS-485 bug: release a bit
 // early and the last byte is truncated, a bit late and it stamps on the reply.
 constexpr int kRs485TxPin = 17;
 constexpr int kRs485RxPin = 18;
-constexpr int kRs485DePin = 16;
+constexpr int kRs485DePin = 21;
 
 // Stage B. Listed here so the pin budget is decided once, not twice.
-constexpr int kI2cSdaPin = 9;
-constexpr int kI2cSclPin = 10;
-constexpr int kTofEnPins[4] = {11, 12, 13, 14};
+constexpr int kI2cSdaPin = 15;
+constexpr int kI2cSclPin = 16;
+// Harness order, not numeric order
+// The array is indexed by TofIndex alongside kTofAddrs and kTofMounts
+// the wiring is absorbed here rather than by renumbering the enum.
+constexpr int kTofEnPins[4] = {11, 12, 14, 13};
 
 // encoders
 
@@ -136,16 +139,16 @@ constexpr uint8_t kTofAddrs[kTofCount] = {0x42, 0x43, 0x44, 0x45};
 constexpr uint32_t kTofEnumHz = 100000;
 
 // Runtime speed is configured per device.
-constexpr uint32_t kTofRunHz = 400000;
+constexpr uint32_t kTofRunHz = 100000;
 
 // Deadline-poll timeouts.
 constexpr uint32_t kTofEnableTimeoutMs = 50;
 constexpr uint32_t kTofCommandTimeoutMs = 100;
 constexpr uint32_t kTofAppStartTimeoutMs = 500;
 
-// Staggered 40 ms captures yield one block read per tick.
-constexpr uint16_t kTofPeriodMs = 40;
-constexpr uint32_t kTofStaggerMs = 10;
+//staggered 70ms captures
+constexpr uint16_t kTofPeriodMs = 70;
+constexpr uint32_t kTofStaggerMs = 17;
 
 // spad_map_id 7, 4x4 normal, 41x52 degrees. The 4x4 maps are TMF8821-only.
 constexpr uint8_t kTofSpadMap = 7;

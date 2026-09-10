@@ -102,7 +102,7 @@ class RvcImu : public gflib::IImu {
         uint32_t lastFrameMs_ = 0;
 };
 
-// MAX3485 half duplex, with the driver enable driven as hardware RTS.
+// SP3485 half duplex, with the driver enable driven as hardware RTS.
 class Rs485Stream : public gflib::IByteStream {
     public:
         Rs485Stream(uart_port_t port, int txPin, int rxPin, int dePin);
