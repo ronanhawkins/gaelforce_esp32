@@ -9,7 +9,8 @@
 
 namespace tof {
 
-// Only the closest of two published objects is read.
+// 18 slots, but 4x4 fills only 1-8 and 10-17 with ONE object each (DS000693 7.4.3).
+// Two objects per zone exist only in 3x3, where 9 zones x 2 fill all 18.
 inline constexpr int kZoneCount = 18;
 
 struct ZoneResult {

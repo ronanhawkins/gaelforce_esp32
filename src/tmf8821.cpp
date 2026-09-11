@@ -65,7 +65,7 @@ constexpr uint8_t kIntResult = 0x02;
 constexpr uint8_t kEnableCpuReady = 0x40;
 constexpr uint8_t kEnablePon      = 0x01;
 
-// cid_rid at 0x20 through object 1 of zone 18 at 0x6D. Object 2 is not read.
+// cid_rid at 0x20 through the last 4x4 zone slot at 0x6D.
 constexpr uint8_t kResultBase  = kRegConfigResult;
 constexpr size_t  kResultBytes = 78;
 constexpr size_t  kZoneBase    = 0x38 - kResultBase;
