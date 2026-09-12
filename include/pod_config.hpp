@@ -3,6 +3,7 @@
 #include "gflib/util.hpp"
 #include "gflib/link.hpp"
 #include "gflib/mcl.hpp"
+#include "tmf8821.hpp"
 
 // Every number that describes this particular robot lives in this file.
 // Nothing below it knows a pin number or a wheel diameter, so retuning the
@@ -138,8 +139,9 @@ constexpr uint8_t kTofAddrs[kTofCount] = {0x42, 0x43, 0x44, 0x45};
 // Enumeration runs at 100kHz.
 constexpr uint32_t kTofEnumHz = 100000;
 
-// Runtime speed is configured per device.
-constexpr uint32_t kTofRunHz = 100000;
+// 400k keeps the 48-byte read near 1ms; 100k overran kLoopPeriodMs. Needs the
+// bus pull-ups at 1.5k or below. Watch busErrors() after changing this.
+constexpr uint32_t kTofRunHz = 400000;
 
 // Deadline-poll timeouts.
 constexpr uint32_t kTofEnableTimeoutMs = 50;
@@ -150,26 +152,66 @@ constexpr uint32_t kTofAppStartTimeoutMs = 500;
 constexpr uint16_t kTofPeriodMs = 70;
 constexpr uint32_t kTofStaggerMs = 17;
 
-// spad_map_id 7, 4x4 normal, 41x52 degrees. The 4x4 maps are TMF8821-only.
-constexpr uint8_t kTofSpadMap = 7;
-constexpr uint16_t kTofKiloIterations = 537;
+// User-defined, single capture: 2 SPADs tall and centred. The stock 4x4 row sat
+// off-axis and floor-saturated at ~64in. Reverting means restoring the angles.
+constexpr uint8_t kTofSpadMap = 14;
+
+// A zone now has 4 SPADs where the stock map had ~11, so this buys most of the
+// light back. Above ~1150k the ranging period overruns kTofPeriodMs.
+constexpr uint16_t kTofKiloIterations = 1000;
+
+// Registers 0x24-0x90, contiguous. Generated, never hand-edited: the enable and
+// TDC fields are bit-packed and one wrong byte silently remaps a zone.
+constexpr uint8_t kTofSpadMaskBlob[] = {
+    0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xCC, 0xC0, 0x03, 0x00, 0xCC,
+    0xC0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x02,
+    0x08
+};
+
+static_assert(kTofSpadMap != 14 || sizeof(kTofSpadMaskBlob) == 0x90 - 0x24 + 1,
+              "spad_map_id 14 needs all 109 SPAD page bytes from the ams tool");
 
 // ToF geometry and preprocessing
 
-// Boards are rotated so the 41° FoV axis is vertical.
-constexpr int kTofZones[4] = {2, 6, 11, 15};
+// assumes a zone reports in the slot matching its TDC channel.
+// One capture, so unlike the stock map these four are simultaneous.
+constexpr int kTofZones[4] = {2, 4, 6, 8};
 
-// Zone offsets used to project readings onto the boresight.
-constexpr real kTofZoneOffAxisDeg[4] = {-19.5_r, -6.5_r, 6.5_r, 19.5_r};
+static_assert(kTofZones[0] <= tof::kZonesRead && kTofZones[1] <= tof::kZonesRead &&
+              kTofZones[2] <= tof::kZonesRead && kTofZones[3] <= tof::kZonesRead,
+              "a zone past kZonesRead is never fetched and reads as no-target");
 
-// Trust radius, not the detection limit.
-constexpr real kTofTrustRadiusIn = 85.0_r;
+// DERIVED from the SPAD pitch, not measured. MUST change with kTofSpadMap.
+constexpr real kTofZoneOffAxisDeg[4] = {-16.22_r, -5.54_r, 5.54_r, 16.22_r};
 
-// Reject grazing returns beyond this incidence.
+// DERIVED, not measured: where the 4.81 deg band catches the floor at a 5.75in
+// mount. Small-angle geometry, so the real knee could be 20in either side.
+constexpr real kTofTrustRadiusIn = 137.0_r;
+
+// Within this of the knee, a floor return and a wall read the same.
+constexpr real kTofSaturationMarginIn = 6.0_r;
+
+// Fires only when the estimate disagrees with the measurement; the spread gate
+// is always tighter. Loose, so a bad estimate cannot starve its own recovery.
 constexpr real kTofMaxIncidenceDeg = 60.0_r;
 
-// Maximum deviation from the projected median.
-constexpr real kTofZoneDispersionIn = 4.0_r;
+// Oblique-wall spread scales with range, so a fixed inch gate quietly tightened
+// as you backed away. As a fraction it admits ~20 deg at any range.
+constexpr real kTofZoneSpreadFrac = 0.15_r;
+
+// Keeps sensorSigmaInches noise from tripping the fraction at close range.
+constexpr real kTofZoneSpreadFloorIn = 2.5_r;
+
+// Half the ranging period plus a tick to notice it. The record says where the
+// robot WAS; uncorrected it drags the cloud back along the direction of travel.
+constexpr real kTofLagMs = 35.0_r;
 
 // Provisional motion gates; tune from Reject::Motion counts.
 constexpr real kTofMaxYawDegPerSec = 180.0_r;
@@ -191,14 +233,32 @@ constexpr gflib::SensorMount kTofMounts[kTofCount] = {
 
 // MCL
 
+// gflib caps this at kMclMaxParticles and init() CLAMPS SILENTLY, hence the
+// assert. More particles buy relocalisation, not converged accuracy.
+constexpr int kMclParticles = 300;
+
+static_assert(kMclParticles <= gflib::kMclMaxParticles,
+              "particleCount above kMclMaxParticles is clamped without a word");
+
 inline gflib::MclConfig makeMcl() {
     gflib::MclConfig c;
 
-    c.particleCount = 200;
+    c.particleCount = kMclParticles;
 
     // PLACEHOLDER: interior half-span to the inner wall face.
     c.fieldHalfWidthInches  = 72.0_r;
     c.fieldHalfHeightInches = 72.0_r;
+
+    // Restated at the gflib default so both floors sit together. This is the
+    // diffusion that keeps a parked cloud honest.
+    c.transNoiseFloorInches = 0.05_r;
+
+    // One shared IMU, arriving as a delta, and range barely sees it: 0.011
+    // in/deg axis-aligned. Non-zero anyway, because position coupling still
+    // prunes a wrong heading and zero would make an IMU error silent.
+    c.headingNoisePerDeg = 0.005_r;
+    c.headingNoisePerInch = 0.005_r;
+    c.headingNoiseFloorDeg = 0.005_r;
 
     c.sensorSigmaInches = 1.5_r;
 

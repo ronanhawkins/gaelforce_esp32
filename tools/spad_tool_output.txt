@@ -1,0 +1,59 @@
+SPAD map tool - standalone version v1.0
+(c) 2022 by ams OSRAM AG. All rights reserved.
+
+/* use this format for custom SPAD maps in the TMF882X firmware */
+const tmf8x2xHalMainSpadConfig tmf8x2xTestSpadMap = 
+{ /*enableSpad[ ]*/ 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x0, 0x0
+, /*tdcChannel[ ]*/ 0x3c0cc00, 0x3c0cc00, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
+, /*tdcChannelSelect*/ 0xc0
+, /*xOffset_2*/ 0
+, /*yOffset_2*/ 0
+, /*xSize*/ 2
+, /*ySize*/ 8
+};
+
+# use this format to set up custom SPAD maps via I2C transfers
+# tmf8x2xHalMainSpadConfig tmf8x2xTestSpadMap
+# enableSpad[ ]
+S 41 W 24 03 00 00 03 00 00 03 00 00 03 00 00 03 00 00 03 00 00 03 00 00 03 00 00 00 00 00 00 00 00 P
+# tdcChannel[ ]
+S 41 W 42 00 cc c0 03 00 cc c0 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 P
+# tdcChannelSelect
+S 41 W 8a c0 00 00 P
+# xOffset_2
+S 41 W 8d 00 P
+# yOffset_2
+S 41 W 8e 00 P
+# xSize
+S 41 W 8f 02 P
+# ySize
+S 41 W 90 08 P
+
+/* SPAD Map Assignment between Zones and TDCs */
+xOffset_2=0 yOffset_2=0 xSize=2 ySize=8
+/* x =     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7  */
+
+/* y=7 */  8 8 
+/* y=6 */  8 8 
+/* y=5 */  6 6 
+/* y=4 */  6 6 
+/* y=3 */  4 4 
+/* y=2 */  4 4 
+/* y=1 */  2 2 
+/* y=0 */  2 2 
+
+/* SPAD Enable Mask Visualization */
+/* x =     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7  */
+
+/* y=11 */ 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+/* y=10 */ 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+/* y= 9 */ 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 
+/* y= 8 */ 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 
+/* y= 7 */ 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 
+/* y= 6 */ 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 
+/* y= 5 */ 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 
+/* y= 4 */ 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 
+/* y= 3 */ 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 
+/* y= 2 */ 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 
+/* y= 1 */ 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+/* y= 0 */ 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 

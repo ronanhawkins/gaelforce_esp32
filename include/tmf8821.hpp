@@ -9,9 +9,13 @@
 
 namespace tof {
 
-// 18 slots, but 4x4 fills only 1-8 and 10-17 with ONE object each (DS000693 7.4.3).
-// Two objects per zone exist only in 3x3, where 9 zones x 2 fill all 18.
+// 18 slots, but 4x4 fills only 1-8 and 10-17 with ONE object each. Two objects
+// per zone exist only in 3x3, where 9 zones x 2 fill all 18.
 inline constexpr int kZoneCount = 18;
+
+// How many are fetched. The rest stay confidence 0, which already means
+// no-target, so reading past this sees an absent zone rather than a wrong one.
+inline constexpr int kZonesRead = 8;
 
 struct ZoneResult {
     // Confidence 0 means no target.
@@ -48,6 +52,10 @@ class Tmf8821 {
 
         // Rebuild the device handle at a new bus speed.
         esp_err_t setSclHz(uint32_t hz);
+
+        // Replay pre-encoded SPAD page bytes. Call before configure() when
+        // spad_map_id selects a user-defined map, or it runs with no mask.
+        esp_err_t downloadSpadMask(const uint8_t* blob, size_t n);
 
         // Configure through one config-page cycle.
         esp_err_t configure(uint16_t periodMs, uint16_t kiloIterations,
@@ -88,7 +96,10 @@ class Tmf8821 {
         esp_err_t downloadFirmware();
         esp_err_t assignAddress();
         esp_err_t loadCommonPage();
-        esp_err_t writeCommonPage();
+        esp_err_t loadSpadPage();
+
+        // CMD_WRITE_CONFIG_PAGE writes whichever page is currently loaded.
+        esp_err_t writeLoadedPage();
 
         int      enPin_;
         uint8_t  runAddr_;

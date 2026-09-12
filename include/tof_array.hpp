@@ -24,6 +24,7 @@ enum class Reject : uint8_t {
     Dispersion,   // zones disagree; no single flat surface fits
     Oblique,      // grazing incidence against the wall it should be facing
     Motion,       // robot moving hard enough to smear the integration
+    Saturated,    // too near the range knee to tell a wall from the floor
 };
 
 struct SensorStatus {
@@ -36,7 +37,8 @@ struct SensorStatus {
     // Last completed measurement, whatever became of it.
     uint16_t lastZoneMm[4] = {};      // raw, per configured zone, pre-projection
     uint8_t  lastZoneConf[4] = {};
-    real     lastMedianInches = 0.0_r;
+    real     lastMedianInches = 0.0_r;   // raw, as measured
+    real     lastLagInches = 0.0_r;      // what lag compensation added
     bool     lastValid = false;
     Reject   lastReject = Reject::Absent;
 
@@ -45,13 +47,13 @@ struct SensorStatus {
 
     uint32_t results = 0;             // records actually read
     uint32_t accepted = 0;
-    uint32_t rejects[7] = {};         // indexed by Reject
+    uint32_t rejects[8] = {};         // indexed by Reject
 
     // Incidence checks skipped because the mount estimate was outside the field.
     uint32_t incidenceUncomputable = 0;
 };
 
-static_assert(static_cast<int>(Reject::Motion) == 6,
+static_assert(static_cast<int>(Reject::Saturated) == 7,
               "SensorStatus::rejects must have one slot per Reject");
 
 // This layer owns neither pose nor link state.
@@ -59,6 +61,10 @@ struct GateContext {
     gflib::Pose estimate{};
     real confidence = 0.0_r;
     real omegaDegPerSec = 0.0_r;
+
+    // Field frame, for lag compensation.
+    real vxInPerSec = 0.0_r;
+    real vyInPerSec = 0.0_r;
     real driveVolts = 0.0_r;
     bool brainInhibits = false;       // disabled or e-stopped
 };
@@ -82,7 +88,7 @@ class TofArray {
     private:
         // Reduce one record to a projected median or rejection.
         Reject reduce(int i, const RawResult& r, const GateContext& ctx,
-                      real& medianInches);
+                      real& rawInches, real& lagInches);
 
         // Wall incidence in degrees, or negative when outside the field.
         real incidenceDeg(const gflib::Pose& at, const gflib::SensorMount& m) const;

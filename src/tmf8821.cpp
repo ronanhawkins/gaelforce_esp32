@@ -39,6 +39,7 @@ constexpr uint8_t kAppBootloader = 0x80;
 constexpr uint8_t kCmdMeasure         = 0x10;
 constexpr uint8_t kCmdWriteConfigPage = 0x15;
 constexpr uint8_t kCmdLoadCommonPage  = 0x16;
+constexpr uint8_t kCmdLoadSpadPage1   = 0x17;
 constexpr uint8_t kCmdI2cAddress      = 0x21;
 constexpr uint8_t kCmdStop            = 0xFF;
 
@@ -57,6 +58,11 @@ constexpr uint8_t kBlChunkBytes    = 128;
 // cid_rid values for the paged window at 0x24..0xDF
 constexpr uint8_t kPageMeasureResult = 0x10;
 constexpr uint8_t kPageCommonConfig  = 0x16;
+constexpr uint8_t kPageSpad1         = 0x17;
+
+// SPAD_ENABLE 0x24-0x41, SPAD_TDC 0x42-0x8C, then offsets and sizes 0x8D-0x90.
+constexpr uint8_t kRegSpadPageBase   = 0x24;
+constexpr size_t  kSpadPageBytes     = 0x90 - 0x24 + 1;
 
 // INT_STATUS bit 1 -- measurement result ready. Write-1-to-clear.
 constexpr uint8_t kIntResult = 0x02;
@@ -65,10 +71,12 @@ constexpr uint8_t kIntResult = 0x02;
 constexpr uint8_t kEnableCpuReady = 0x40;
 constexpr uint8_t kEnablePon      = 0x01;
 
-// cid_rid at 0x20 through the last 4x4 zone slot at 0x6D.
+// cid_rid at 0x20, then the header, then 3 bytes per zone from 0x38.
 constexpr uint8_t kResultBase  = kRegConfigResult;
-constexpr size_t  kResultBytes = 78;
 constexpr size_t  kZoneBase    = 0x38 - kResultBase;
+
+// Stop after kZonesRead; the zones past it are bus time nothing consumes.
+constexpr size_t  kResultBytes = kZoneBase + 3 * kZonesRead;
 
 constexpr int kXferTimeoutMs = 100;
 
@@ -311,12 +319,36 @@ esp_err_t Tmf8821::loadCommonPage() {
     return cid == kPageCommonConfig ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
-esp_err_t Tmf8821::writeCommonPage() {
+esp_err_t Tmf8821::writeLoadedPage() {
     ESP_RETURN_ON_ERROR(wr8(kRegCmdStat, kCmdWriteConfigPage), kTag, "write page");
 
     uint8_t status = 0xFF;
     ESP_RETURN_ON_ERROR(waitCommand(status, 100), kTag, "write page wait");
     return status == kStatusOk ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+esp_err_t Tmf8821::loadSpadPage() {
+    ESP_RETURN_ON_ERROR(wr8(kRegCmdStat, kCmdLoadSpadPage1), kTag, "load spad page");
+
+    uint8_t status = 0xFF;
+    ESP_RETURN_ON_ERROR(waitCommand(status, 100), kTag, "load spad page wait");
+    if (status != kStatusOk) return ESP_ERR_INVALID_RESPONSE;
+
+    uint8_t cid = 0;
+    ESP_RETURN_ON_ERROR(rd8(kRegConfigResult, cid), kTag, "cid");
+    return cid == kPageSpad1 ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t Tmf8821::downloadSpadMask(const uint8_t* blob, size_t n) {
+    if (!present_) return ESP_ERR_INVALID_STATE;
+
+    // The SPAD_ENABLE/SPAD_TDC packing is never decoded here; these bytes are
+    // replayed verbatim, so a short blob means a truncated paste.
+    if (blob == nullptr || n != kSpadPageBytes) return ESP_ERR_INVALID_ARG;
+
+    ESP_RETURN_ON_ERROR(loadSpadPage(), kTag, "load page for spad mask");
+    ESP_RETURN_ON_ERROR(wr(kRegSpadPageBase, blob, n), kTag, "spad mask bytes");
+    return writeLoadedPage();
 }
 
 esp_err_t Tmf8821::assignAddress() {
@@ -328,7 +360,7 @@ esp_err_t Tmf8821::assignAddress() {
 
     // Zero applies the address change unconditionally.
     ESP_RETURN_ON_ERROR(wr8(kRegI2cAddrChg, 0x00), kTag, "addr change gate");
-    ESP_RETURN_ON_ERROR(writeCommonPage(), kTag, "write page for address");
+    ESP_RETURN_ON_ERROR(writeLoadedPage(), kTag, "write page for address");
 
     // The command status appears at the new address.
     ESP_RETURN_ON_ERROR(wr8(kRegCmdStat, kCmdI2cAddress), kTag, "addr command");
@@ -378,7 +410,7 @@ esp_err_t Tmf8821::configure(uint16_t periodMs, uint16_t kiloIterations,
 
     ESP_RETURN_ON_ERROR(wr8(kRegConfThresh, confidenceThreshold), kTag, "conf thresh");
     ESP_RETURN_ON_ERROR(wr8(kRegSpadMapId, spadMapId), kTag, "spad map");
-    ESP_RETURN_ON_ERROR(writeCommonPage(), kTag, "write config");
+    ESP_RETURN_ON_ERROR(writeLoadedPage(), kTag, "write config");
 
     // Disable the unwired interrupt pin; status still updates.
     ESP_RETURN_ON_ERROR(wr8(kRegIntEnab, 0x00), kTag, "int enab");
@@ -439,7 +471,7 @@ bool Tmf8821::readResult(RawResult& out) {
     out.ambient      = le32(&buf[8]);
     out.sysTick      = le32(&buf[20]);
 
-    for (int z = 0; z < kZoneCount; ++z) {
+    for (int z = 0; z < kZonesRead; ++z) {
         const size_t b = kZoneBase + 3 * static_cast<size_t>(z);
         out.zones[z].confidence = buf[b];
         out.zones[z].distanceMm =

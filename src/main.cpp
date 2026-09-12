@@ -38,6 +38,9 @@ tof::TofArray g_tof;
 // State for rate-limited divergence recovery.
 uint32_t g_lastReseedMs = 0;
 uint32_t g_mclReseeds = 0;
+
+// -1 when idle, otherwise the section telemetry emits on this tick.
+int g_telemetrySection = -1;
 bool g_haveReseeded = false;
 
 // Separate MCL and I2C timing statistics.
@@ -297,102 +300,124 @@ void listen(uint32_t nowMs, int64_t txStartUs, int64_t windowUs) {
     }
 }
 
-void telemetry() {
-    if (g_loop.ticks == 0) return;
-
-    const gflib::LinkStats& s = g_parser.stats();
-    const gflib::Pose p = g_odom.getPose();
-
-    const double meanPeriodUs = static_cast<double>(g_loop.periodSumUs) / g_loop.ticks;
-
-    ESP_LOGI(kTag,
-             "pose %.2f %.2f %.2f | enc %.0f %.0f hdg %.2f imu %" PRIu32 "/%" PRIu32
-             " | loop %.2f/%.2f/%.2f ms work %.2f",
-             p.x, p.y, p.thetaDeg, g_vert.getCounts(), g_horiz.getCounts(),
-             g_imu.getHeadingDeg(), g_imu.frameCount(), g_imu.checksumErrors(),
-             g_loop.periodMinUs / 1000.0, meanPeriodUs / 1000.0, g_loop.periodMaxUs / 1000.0,
-             g_loop.workMaxUs / 1000.0);
-
-    if (g_rtt.samples > 0) {
-        // Air time is exact at this baud and must come off before the
-        // remainder is halved
-        const double poseAirMs = cfg::airTimeMs(g_lastPoseFrameBytes);
-        const double statusAirMs = cfg::airTimeMs(g_lastStatusFrameBytes);
-
-        const double meanRttMs = (static_cast<double>(g_rtt.sumUs) / g_rtt.samples) / 1000.0;
-        const double unknownMs = meanRttMs - poseAirMs - statusAirMs;
-        const double oneWayMs = poseAirMs + unknownMs / 2.0;
+// ONE SECTION PER TICK. The console blocks and the whole dump is ~1.7kB, which
+// overruns vTaskDelayUntil; the catch-up ticks then hand OdomPoseSource an
+// elapsedMs of 0 or 1 and turn encoder quantisation into a bogus velocity.
+bool telemetrySection(int phase) {
+    switch (phase) {
+    case 0: {
+        if (g_loop.ticks == 0) return true;
+        const gflib::Pose p = g_odom.getPose();
+        const double meanPeriodUs = static_cast<double>(g_loop.periodSumUs) / g_loop.ticks;
 
         ESP_LOGI(kTag,
-                 "rtt %.2f/%.2f/%.2f ms n=%" PRIu32
-                 " | air pose %.2f status %.2f | transit %.2f ms",
-                 g_rtt.minUs / 1000.0, meanRttMs, g_rtt.maxUs / 1000.0, g_rtt.samples,
-                 poseAirMs, statusAirMs, oneWayMs);
-    } else {
-        ESP_LOGW(kTag, "rtt: no BrainStatus replies this window");
+                 "pose %.2f %.2f %.2f | enc %.0f %.0f hdg %.2f imu %" PRIu32 "/%" PRIu32
+                 " | loop %.2f/%.2f/%.2f ms work %.2f",
+                 p.x, p.y, p.thetaDeg, g_vert.getCounts(), g_horiz.getCounts(),
+                 g_imu.getHeadingDeg(), g_imu.frameCount(), g_imu.checksumErrors(),
+                 g_loop.periodMinUs / 1000.0, meanPeriodUs / 1000.0,
+                 g_loop.periodMaxUs / 1000.0, g_loop.workMaxUs / 1000.0);
+
+        // Reset per section, so each window covers only what it reported.
+        g_loop.reset();
+        break;
     }
+    case 1: {
+        if (g_rtt.samples > 0) {
+            // Air time is exact at this baud and must come off before the
+            // remainder is halved
+            const double poseAirMs = cfg::airTimeMs(g_lastPoseFrameBytes);
+            const double statusAirMs = cfg::airTimeMs(g_lastStatusFrameBytes);
 
-    ESP_LOGI(kTag,
-             "link crc %" PRIu32 " resync %" PRIu32 " dropped %" PRIu32 " ooo %" PRIu32
-             " ver %" PRIu32 " len %" PRIu32 " unk %" PRIu32 " frames %" PRIu32,
-             s.crcErrors, s.resyncBytes, s.droppedFrames, s.outOfOrderFrames,
-             s.versionMismatches, s.lengthErrors, s.unknownTypes, s.framesDecoded);
+            const double meanRttMs = (static_cast<double>(g_rtt.sumUs) / g_rtt.samples) / 1000.0;
+            const double unknownMs = meanRttMs - poseAirMs - statusAirMs;
+            const double oneWayMs = poseAirMs + unknownMs / 2.0;
 
-    if (g_droppedSends > 0) ESP_LOGW(kTag, "dropped sends %" PRIu32, g_droppedSends);
-
-    // MCL pose, spread, and divergence diagnostics.
-    const gflib::Pose m = g_mcl.estimate();
-    ESP_LOGI(kTag,
-             "mcl %.2f %.2f %.2f | conf %.2f spread %.2f hdg-sd %.2f ess %.0f/%d"
-             " | gated %" PRIu32 " diverged %" PRIu32 " reseeds %" PRIu32 "%s",
-             m.x, m.y, m.thetaDeg, g_mcl.confidence(), g_mcl.positionStdDevInches(),
-             g_mcl.headingStdDevDeg(), g_mcl.effectiveSampleSize(), g_mcl.particleCount(),
-             g_mcl.gatedReadings(), g_mcl.divergences(), g_mclReseeds,
-             g_mcl.diverged() ? " DIVERGED" : "");
-
-    if (g_mclTicks > 0) {
+            ESP_LOGI(kTag,
+                     "rtt %.2f/%.2f/%.2f ms n=%" PRIu32
+                     " | air pose %.2f status %.2f | transit %.2f ms",
+                     g_rtt.minUs / 1000.0, meanRttMs, g_rtt.maxUs / 1000.0, g_rtt.samples,
+                     poseAirMs, statusAirMs, oneWayMs);
+        } else {
+            ESP_LOGW(kTag, "rtt: no BrainStatus replies this window");
+        }
+        g_rtt.reset();
+        break;
+    }
+    case 2: {
+        const gflib::LinkStats& s = g_parser.stats();
         ESP_LOGI(kTag,
-                 "cost mcl %.2f/%.2f ms | tof i2c %.2f/%.2f ms  mean/max over %" PRIu32
-                 " ticks (%d particles)",
-                 (static_cast<double>(g_mclSumUs) / g_mclTicks) / 1000.0, g_mclMaxUs / 1000.0,
-                 (static_cast<double>(g_tofSumUs) / g_mclTicks) / 1000.0, g_tofMaxUs / 1000.0,
-                 g_mclTicks, g_mcl.particleCount());
-    }
-    g_mclMaxUs = 0;
-    g_mclSumUs = 0;
-    g_tofMaxUs = 0;
-    g_tofSumUs = 0;
-    g_mclTicks = 0;
+                 "link crc %" PRIu32 " resync %" PRIu32 " dropped %" PRIu32 " ooo %" PRIu32
+                 " ver %" PRIu32 " len %" PRIu32 " unk %" PRIu32 " frames %" PRIu32,
+                 s.crcErrors, s.resyncBytes, s.droppedFrames, s.outOfOrderFrames,
+                 s.versionMismatches, s.lengthErrors, s.unknownTypes, s.framesDecoded);
 
-    // Per-sensor ToF diagnostics expose mount errors.
-    static const char* kRejectName[] = {"ok", "absent", "noret", "range",
-                                        "disp", "obliq", "motion"};
-    for (int i = 0; i < cfg::kTofCount; ++i) {
+        if (g_droppedSends > 0) ESP_LOGW(kTag, "dropped sends %" PRIu32, g_droppedSends);
+        break;
+    }
+    case 3: {
+        // spread is how much the particles agree, NOT how right they are.
+        const gflib::Pose m = g_mcl.estimate();
+        ESP_LOGI(kTag,
+                 "mcl %.2f %.2f %.2f | conf %.2f spread %.2f hdg-sd %.2f ess %.0f/%d"
+                 " | gated %" PRIu32 " diverged %" PRIu32 " reseeds %" PRIu32 "%s",
+                 m.x, m.y, m.thetaDeg, g_mcl.confidenceAt(m), g_mcl.positionStdDevInches(),
+                 g_mcl.headingStdDevDeg(), g_mcl.effectiveSampleSize(), g_mcl.particleCount(),
+                 g_mcl.gatedReadings(), g_mcl.divergences(), g_mclReseeds,
+                 g_mcl.diverged() ? " DIVERGED" : "");
+        break;
+    }
+    case 4: {
+        if (g_mclTicks > 0) {
+            ESP_LOGI(kTag,
+                     "cost mcl %.2f/%.2f ms | tof i2c %.2f/%.2f ms  mean/max over %" PRIu32
+                     " ticks (%d particles)",
+                     (static_cast<double>(g_mclSumUs) / g_mclTicks) / 1000.0, g_mclMaxUs / 1000.0,
+                     (static_cast<double>(g_tofSumUs) / g_mclTicks) / 1000.0, g_tofMaxUs / 1000.0,
+                     g_mclTicks, g_mcl.particleCount());
+        }
+        g_mclMaxUs = 0;
+        g_mclSumUs = 0;
+        g_tofMaxUs = 0;
+        g_tofSumUs = 0;
+        g_mclTicks = 0;
+        break;
+    }
+    default: {
+        // Per-sensor ToF diagnostics expose mount errors.
+        static const char* kRejectName[] = {"ok", "absent", "noret", "range",
+                                            "disp", "obliq", "motion", "sat"};
+        const int i = phase - 5;
+        if (i < 0 || i >= cfg::kTofCount) return true;
+
         const tof::SensorStatus& t = g_tof.status(i);
         if (!t.present) {
             ESP_LOGW(kTag, "tof%d ABSENT (never enumerated)", i);
-            continue;
+        } else {
+            ESP_LOGI(kTag,
+                     "tof%d @0x%02X cal 0x%02X t1st %" PRIu32 " ms | zones %4u/%3u %4u/%3u %4u/%3u %4u/%3u mm/conf"
+                     " | med %6.2f lag %+5.2f in %s | n %" PRIu32 " ok %" PRIu32
+                     " noret %" PRIu32 " range %" PRIu32 " disp %" PRIu32
+                     " obliq %" PRIu32 " motion %" PRIu32 " sat %" PRIu32
+                     " nogate %" PRIu32 " bus %" PRIu32,
+                     i, t.address, t.calibrationStatus, t.firstResultMs,
+                     t.lastZoneMm[0], t.lastZoneConf[0], t.lastZoneMm[1], t.lastZoneConf[1],
+                     t.lastZoneMm[2], t.lastZoneConf[2], t.lastZoneMm[3], t.lastZoneConf[3],
+                     t.lastMedianInches, t.lastLagInches,
+                     kRejectName[static_cast<int>(t.lastReject)],
+                     t.results, t.accepted,
+                     t.rejects[static_cast<int>(tof::Reject::NoReturn)],
+                     t.rejects[static_cast<int>(tof::Reject::OutOfRange)],
+                     t.rejects[static_cast<int>(tof::Reject::Dispersion)],
+                     t.rejects[static_cast<int>(tof::Reject::Oblique)],
+                     t.rejects[static_cast<int>(tof::Reject::Motion)],
+                     t.rejects[static_cast<int>(tof::Reject::Saturated)],
+                     t.incidenceUncomputable, t.busErrors);
         }
-        ESP_LOGI(kTag,
-                 "tof%d @0x%02X cal 0x%02X t1st %" PRIu32 " ms | zones %4u/%3u %4u/%3u %4u/%3u %4u/%3u mm/conf"
-                 " | med %6.2f in %s | n %" PRIu32 " ok %" PRIu32
-                 " noret %" PRIu32 " range %" PRIu32 " disp %" PRIu32
-                 " obliq %" PRIu32 " motion %" PRIu32 " nogate %" PRIu32 " bus %" PRIu32,
-                 i, t.address, t.calibrationStatus, t.firstResultMs,
-                 t.lastZoneMm[0], t.lastZoneConf[0], t.lastZoneMm[1], t.lastZoneConf[1],
-                 t.lastZoneMm[2], t.lastZoneConf[2], t.lastZoneMm[3], t.lastZoneConf[3],
-                 t.lastMedianInches, kRejectName[static_cast<int>(t.lastReject)],
-                 t.results, t.accepted,
-                 t.rejects[static_cast<int>(tof::Reject::NoReturn)],
-                 t.rejects[static_cast<int>(tof::Reject::OutOfRange)],
-                 t.rejects[static_cast<int>(tof::Reject::Dispersion)],
-                 t.rejects[static_cast<int>(tof::Reject::Oblique)],
-                 t.rejects[static_cast<int>(tof::Reject::Motion)],
-                 t.incidenceUncomputable, t.busErrors);
+        return i == cfg::kTofCount - 1;
     }
-
-    g_loop.reset();
-    g_rtt.reset();
+    }
+    return false;
 }
 
 }  // namespace
@@ -471,14 +496,19 @@ extern "C" void app_main(void) {
 
         // Traverse the cloud once for gating, flags, and reporting.
         const gflib::Pose mclPose = g_mcl.estimate();
-        const double confidence = g_mcl.confidence();
+        const double confidence = g_mcl.confidenceAt(mclPose);
 
         tof::GateContext gate;
         gate.estimate = mclPose;
         gate.confidence = static_cast<gflib::real>(confidence);
-        gate.omegaDegPerSec = g_odom.getVelocity().omegaDegPerSec;
+        const gflib::Velocity vel = g_odom.getVelocity();
+        gate.omegaDegPerSec = vel.omegaDegPerSec;
+        gate.vxInPerSec = vel.vx;
+        gate.vyInPerSec = vel.vy;
 
         // Treat stale drive voltage as unknown; yaw remains measured.
+        // A stale link leaves brainInhibits false ON PURPOSE: a dropout must not
+        // stop the pod correcting its pose.
         const bool statusFresh =
             g_haveStatus && !gflib::linkIsStale(nowMs, g_statusMs, cfg::kBrainStatusTimeoutMs);
         if (statusFresh) {
@@ -498,7 +528,8 @@ extern "C" void app_main(void) {
 
         const int64_t mclResumeUs = esp_timer_get_time();
         if (fresh != nullptr) {
-            g_mcl.update(cfg::kTofMounts, cfg::kTofCount, fresh, 1);
+            g_mcl.update(cfg::kTofMounts, cfg::kTofCount, fresh, 1, mclPose,
+                         static_cast<gflib::real>(confidence));
         }
 
         // Recover latched divergence from odometry, with rate limiting.
@@ -528,10 +559,15 @@ extern "C" void app_main(void) {
 
         g_loop.addWork(esp_timer_get_time() - tickUs);
 
-        // Printed last, inside the slack that is left. At 921600 baud a line
-        // of this length is well under a millisecond, so it lands before
-        // vTaskDelayUntil is due and the period stays flat.
-        if (g_loop.ticks >= 100) telemetry();
+        // Printed last, inside the slack that is left.
+        // Start a cycle roughly once a second, then one section per tick.
+        if (g_telemetrySection < 0) {
+            if (g_loop.ticks >= 100) g_telemetrySection = 0;
+        } else if (telemetrySection(g_telemetrySection)) {
+            g_telemetrySection = -1;
+        } else {
+            ++g_telemetrySection;
+        }
 
         vTaskDelayUntil(&last, pdMS_TO_TICKS(cfg::kLoopPeriodMs));
     }

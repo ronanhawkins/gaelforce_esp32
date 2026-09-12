@@ -70,7 +70,9 @@ esp_err_t TofArray::begin() {
     bc.clk_source = I2C_CLK_SRC_DEFAULT;
     bc.glitch_ignore_cnt = 7;
 
-    // Use the external 2.2k pull-ups.
+    // The only pull-ups are the breakouts' own, so bus resistance is theirs
+    // divided by however many jumpers are closed, and that count sets the rise
+    // time kTofRunHz needs. The internal ~45k cannot drive I2C at any speed.
     bc.flags.enable_internal_pullup = false;
 
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bc, &bus_), kTag, "i2c bus");
@@ -102,6 +104,14 @@ esp_err_t TofArray::begin() {
         const esp_err_t setup = [&] {
             esp_err_t e = dev_[i].setSclHz(cfg::kTofRunHz);
             if (e != ESP_OK) return e;
+
+            // The mask must land before spad_map_id selects it, or the part
+            // configures a user-defined map with nothing behind it.
+            if (cfg::kTofSpadMap >= 14) {
+                e = dev_[i].downloadSpadMask(cfg::kTofSpadMaskBlob,
+                                             sizeof(cfg::kTofSpadMaskBlob));
+                if (e != ESP_OK) return e;
+            }
             e = dev_[i].configure(cfg::kTofPeriodMs, cfg::kTofKiloIterations,
                                   cfg::kTofSpadMap, 6);
             if (e != ESP_OK) return e;
@@ -165,7 +175,7 @@ real TofArray::incidenceDeg(const gflib::Pose& at, const gflib::SensorMount& m) 
 }
 
 Reject TofArray::reduce(int i, const RawResult& r, const GateContext& ctx,
-                        real& medianInches) {
+                        real& rawInches, real& lagInches) {
     SensorStatus& s = status_[i];
 
     // Capture raw telemetry before applying gates.
@@ -187,25 +197,47 @@ Reject TofArray::reduce(int i, const RawResult& r, const GateContext& ctx,
         proj[n++] = inches * std::cos(cfg::kTofZoneOffAxisDeg[z] * gflib::kDegToRad);
     }
 
-    // Reject motion that smears the integration.
+    // Before the motion gate: an empty record is a NoReturn whatever the robot
+    // was doing, and calling it Motion hides empty records taken rolling.
+    if (n < kMinValidZones) return Reject::NoReturn;
+
+    const real rawMed = medianOf(proj, n);
+    rawInches = rawMed;
+
+    // Reject wall edges and partial occlusions. The tolerance scales because an
+    // oblique wall's spread grows with range; a fixed one only passed normals.
+    const real tol = (cfg::kTofZoneSpreadFrac * rawMed > cfg::kTofZoneSpreadFloorIn)
+                         ? cfg::kTofZoneSpreadFrac * rawMed
+                         : cfg::kTofZoneSpreadFloorIn;
+    for (int k = 0; k < n; ++k) {
+        if (std::fabs(proj[k] - rawMed) > tol) return Reject::Dispersion;
+    }
+
+    // Both ask what the optics physically did, so they test the RAW median. Lag
+    // compensation is a statement about time, not about what the sensor saw.
+    if (rawMed > cfg::kTofTrustRadiusIn) return Reject::OutOfRange;
+
+    // Past the knee every zone grazes the same floor and they AGREE, so the
+    // spread gate cannot see it. This is the only gate that catches it.
+    if (rawMed > cfg::kTofTrustRadiusIn - cfg::kTofSaturationMarginIn) {
+        return Reject::Saturated;
+    }
+
+    // Last: the gates above describe what the optics did, so their counters
+    // stay meaningful while driving. This one is only about trusting it.
     if (ctx.brainInhibits ||
         std::fabs(ctx.omegaDegPerSec) > cfg::kTofMaxYawDegPerSec ||
         std::fabs(ctx.driveVolts) > cfg::kTofMaxDriveVolts) {
         return Reject::Motion;
     }
 
-    if (n < kMinValidZones) return Reject::NoReturn;
+    // Close the gap: the record describes where the robot was kTofLagMs ago.
+    const real bRad = (static_cast<real>(ctx.estimate.thetaDeg) +
+                       cfg::kTofMounts[i].bearingDeg) * gflib::kDegToRad;
+    const real closingInPerSec =
+        ctx.vxInPerSec * std::sin(bRad) + ctx.vyInPerSec * std::cos(bRad);
 
-    const real med = medianOf(proj, n);
-    medianInches = med;
-
-    // Reject wall edges and partial occlusions.
-    for (int k = 0; k < n; ++k) {
-        if (std::fabs(proj[k] - med) > cfg::kTofZoneDispersionIn) return Reject::Dispersion;
-    }
-
-    // Reject distances beyond the modeled noise range.
-    if (med > cfg::kTofTrustRadiusIn) return Reject::OutOfRange;
+    lagInches = -closingInPerSec * (cfg::kTofLagMs / 1000.0_r);
 
     // Apply the geometric gate only when the estimate is trusted.
     if (ctx.confidence >= gateMinConfidence_) {
@@ -222,14 +254,22 @@ Reject TofArray::reduce(int i, const RawResult& r, const GateContext& ctx,
 }
 
 const gflib::SensorReading* TofArray::poll(const GateContext& ctx) {
-    const int i = slot_;
+    // INT_STATUS is one byte, the result is kResultBytes. Checking all four and
+    // reading only the ready one drops the time to notice a publication from a
+    // full round-robin to one tick. kTofStaggerMs keeps at most one ready.
+    int i = -1;
+    for (int n = 0; n < cfg::kTofCount; ++n) {
+        const int c = (slot_ + n) % cfg::kTofCount;
+        if (!status_[c].present) continue;
+        if (dev_[c].resultReady()) { i = c; break; }
+    }
+
+    // Rotate the start so a tie never starves the same sensor.
     slot_ = (slot_ + 1) % cfg::kTofCount;
+    if (i < 0) return nullptr;
 
     // Consume each reading once.
     readings_[i].valid = false;
-
-    if (!status_[i].present) return nullptr;
-    if (!dev_[i].resultReady()) return nullptr;
 
     RawResult r;
     if (!dev_[i].readResult(r)) {
@@ -252,11 +292,14 @@ const gflib::SensorReading* TofArray::poll(const GateContext& ctx) {
     ++s.results;
     s.busErrors = dev_[i].busErrors();
 
-    real median = 0.0_r;
-    const Reject why = reduce(i, r, ctx, median);
+    // Raw is what the optics measured; lag is what MCL adds. Kept apart so the
+    // column does not mean two things on accept and on reject.
+    real raw = 0.0_r, lag = 0.0_r;
+    const Reject why = reduce(i, r, ctx, raw, lag);
 
     s.lastReject = why;
-    s.lastMedianInches = median;
+    s.lastMedianInches = raw;
+    s.lastLagInches = lag;
     s.lastValid = (why == Reject::None);
     ++s.rejects[static_cast<int>(why)];
 
@@ -264,7 +307,9 @@ const gflib::SensorReading* TofArray::poll(const GateContext& ctx) {
     ++s.accepted;
 
     readings_[i].mountIndex = i;
-    readings_[i].distanceInches = median;
+
+    // MCL gets the lag-corrected value; status keeps the raw one.
+    readings_[i].distanceInches = raw + lag;
     readings_[i].valid = true;
     return &readings_[i];
 }
