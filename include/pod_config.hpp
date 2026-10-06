@@ -23,10 +23,10 @@ using gflib::operator""_r;
 
 // Quadrature pods, through the SN74LVC245A. The 245 drives actively, so the
 // PCNT channels' default pull-ups are along for the ride and harmless.
-constexpr int kVertEncAPin  = 1;
-constexpr int kVertEncBPin  = 2;
-constexpr int kHorizEncAPin = 3;
-constexpr int kHorizEncBPin = 4;
+constexpr int kVertEncAPin  = 40;
+constexpr int kVertEncBPin  = 42;
+constexpr int kHorizEncAPin = 39;
+constexpr int kHorizEncBPin = 41;
 
 // BNO085 UART-RVC. RX only: RVC is one-way and the part accepts nothing back.
 // The P0 jumper on the breakout must be bridged or it comes up in I2C mode
@@ -39,7 +39,7 @@ constexpr int kImuRxPin = 8;
 // early and the last byte is truncated, a bit late and it stamps on the reply.
 constexpr int kRs485TxPin = 17;
 constexpr int kRs485RxPin = 18;
-constexpr int kRs485DePin = 21;
+constexpr int kRs485DePin = 7;
 
 
 constexpr int kI2cSdaPin = 16;
@@ -47,7 +47,7 @@ constexpr int kI2cSclPin = 15;
 // Harness order, not numeric order
 // The array is indexed by TofIndex alongside kTofAddrs and kTofMounts
 // the wiring is absorbed here rather than by renumbering the enum.
-constexpr int kTofEnPins[4] = {11, 12, 14, 13};
+constexpr int kTofEnPins[4] = {4, 12, 1, 2};
 
 // encoders
 

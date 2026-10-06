@@ -53,8 +53,9 @@ class Tmf8821 {
         // Rebuild the device handle at a new bus speed.
         esp_err_t setSclHz(uint32_t hz);
 
-        // Replay pre-encoded SPAD page bytes. Call before configure() when
-        // spad_map_id selects a user-defined map, or it runs with no mask.
+        // Replay pre-encoded SPAD page bytes. Call AFTER a configure() that
+        // selects a user-defined spad_map_id, or the SPAD page will not load,
+        // then configure() again before startMeasuring().
         esp_err_t downloadSpadMask(const uint8_t* blob, size_t n);
 
         // Configure through one config-page cycle.

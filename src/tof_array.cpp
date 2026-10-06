@@ -105,16 +105,22 @@ esp_err_t TofArray::begin() {
             esp_err_t e = dev_[i].setSclHz(cfg::kTofRunHz);
             if (e != ESP_OK) return e;
 
-            // The mask must land before spad_map_id selects it, or the part
-            // configures a user-defined map with nothing behind it.
+            e = dev_[i].configure(cfg::kTofPeriodMs, cfg::kTofKiloIterations,
+                                  cfg::kTofSpadMap, 6);
+            if (e != ESP_OK) return e;
+
+            // spad_map_id must already select a user-defined map or the SPAD
+            // page refuses to load. Mask-first failed on all four sensors on
+            // the bench (tools/tof_test); this exact sequence is what passed,
+            // including the second configure() after the mask.
             if (cfg::kTofSpadMap >= 14) {
                 e = dev_[i].downloadSpadMask(cfg::kTofSpadMaskBlob,
                                              sizeof(cfg::kTofSpadMaskBlob));
                 if (e != ESP_OK) return e;
+                e = dev_[i].configure(cfg::kTofPeriodMs, cfg::kTofKiloIterations,
+                                      cfg::kTofSpadMap, 6);
+                if (e != ESP_OK) return e;
             }
-            e = dev_[i].configure(cfg::kTofPeriodMs, cfg::kTofKiloIterations,
-                                  cfg::kTofSpadMap, 6);
-            if (e != ESP_OK) return e;
             return dev_[i].startMeasuring();
         }();
 
