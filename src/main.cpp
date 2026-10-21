@@ -300,29 +300,65 @@ void listen(uint32_t nowMs, int64_t txStartUs, int64_t windowUs) {
     }
 }
 
+// Bench bring-up: print only the encoder, IMU and pose lines. The link, MCL
+// and ToF sections are noise until those parts are wired, and they push the
+// lines you are actually watching off the screen.
+constexpr bool kTelemetryOdomOnly = true;
+
+// Frame count at the previous IMU line, for a frames/s figure. RVC streams
+// at 100Hz unprompted, so anything far from 100/s is wiring, not motion.
+int64_t g_imuSnapUs = 0;
+uint32_t g_imuSnapFrames = 0;
+
 // ONE SECTION PER TICK. The console blocks and the whole dump is ~1.7kB, which
 // overruns vTaskDelayUntil; the catch-up ticks then hand OdomPoseSource an
 // elapsedMs of 0 or 1 and turn encoder quantisation into a bogus velocity.
 bool telemetrySection(int phase) {
     switch (phase) {
     case 0: {
-        if (g_loop.ticks == 0) return true;
-        const gflib::Pose p = g_odom.getPose();
-        const double meanPeriodUs = static_cast<double>(g_loop.periodSumUs) / g_loop.ticks;
-
-        ESP_LOGI(kTag,
-                 "pose %.2f %.2f %.2f | enc %.0f %.0f hdg %.2f imu %" PRIu32 "/%" PRIu32
-                 " | loop %.2f/%.2f/%.2f ms work %.2f",
-                 p.x, p.y, p.thetaDeg, g_vert.getCounts(), g_horiz.getCounts(),
-                 g_imu.getHeadingDeg(), g_imu.frameCount(), g_imu.checksumErrors(),
-                 g_loop.periodMinUs / 1000.0, meanPeriodUs / 1000.0,
-                 g_loop.periodMaxUs / 1000.0, g_loop.workMaxUs / 1000.0);
-
-        // Reset per section, so each window covers only what it reported.
-        g_loop.reset();
+        // Inches are only as right as kTrackingWheelDiaIn.
+        const gflib::OdomConfig& oc = g_odom.config().odom;
+        const double v = g_vert.getCounts();
+        const double h = g_horiz.getCounts();
+        printf("enc  v %+7.0f %+7.2fin  h %+7.0f %+7.2fin\n", v, v * oc.vertInchesPerCount,
+               h, h * oc.horizInchesPerCount);
         break;
     }
     case 1: {
+        const int64_t us = esp_timer_get_time();
+        const uint32_t frames = g_imu.frameCount();
+        const double fps =
+            g_imuSnapUs ? (frames - g_imuSnapFrames) * 1e6 / (us - g_imuSnapUs) : 0.0;
+        g_imuSnapUs = us;
+        g_imuSnapFrames = frames;
+
+        // Wrapped for reading; odometry uses the unwrapped value.
+        double hdg = std::fmod(g_imu.getHeadingDeg(), 360.0);
+        if (hdg < 0.0) hdg += 360.0;
+
+        if (g_imu.ok(g_clock.millisNow())) {
+            printf("imu  %6.2f deg  %3.0f/s\n", hdg, fps);
+        } else {
+            printf("imu  NO FRAMES (P0/ground/RX)\n");
+        }
+        if (g_imu.checksumErrors() > 0) printf("imu  bad checksums %" PRIu32 "\n", g_imu.checksumErrors());
+        break;
+    }
+    case 2: {
+        const gflib::Pose p = g_odom.getPose();
+        printf("pose x %+7.2f  y %+7.2f  th %+7.2f\n\n", p.x, p.y, p.thetaDeg);
+
+        if (!kTelemetryOdomOnly && g_loop.ticks > 0) {
+            const double meanPeriodUs = static_cast<double>(g_loop.periodSumUs) / g_loop.ticks;
+            ESP_LOGI(kTag, "loop %.2f/%.2f/%.2f ms work %.2f", g_loop.periodMinUs / 1000.0,
+                     meanPeriodUs / 1000.0, g_loop.periodMaxUs / 1000.0,
+                     g_loop.workMaxUs / 1000.0);
+        }
+        // Reset per section, so each window covers only what it reported.
+        g_loop.reset();
+        return kTelemetryOdomOnly;
+    }
+    case 3: {
         if (g_rtt.samples > 0) {
             // Air time is exact at this baud and must come off before the
             // remainder is halved
@@ -344,7 +380,7 @@ bool telemetrySection(int phase) {
         g_rtt.reset();
         break;
     }
-    case 2: {
+    case 4: {
         const gflib::LinkStats& s = g_parser.stats();
         ESP_LOGI(kTag,
                  "link crc %" PRIu32 " resync %" PRIu32 " dropped %" PRIu32 " ooo %" PRIu32
@@ -355,7 +391,7 @@ bool telemetrySection(int phase) {
         if (g_droppedSends > 0) ESP_LOGW(kTag, "dropped sends %" PRIu32, g_droppedSends);
         break;
     }
-    case 3: {
+    case 5: {
         // spread is how much the particles agree, NOT how right they are.
         const gflib::Pose m = g_mcl.estimate();
         ESP_LOGI(kTag,
@@ -367,7 +403,7 @@ bool telemetrySection(int phase) {
                  g_mcl.diverged() ? " DIVERGED" : "");
         break;
     }
-    case 4: {
+    case 6: {
         if (g_mclTicks > 0) {
             ESP_LOGI(kTag,
                      "cost mcl %.2f/%.2f ms | tof i2c %.2f/%.2f ms  mean/max over %" PRIu32
@@ -387,7 +423,7 @@ bool telemetrySection(int phase) {
         // Per-sensor ToF diagnostics expose mount errors.
         static const char* kRejectName[] = {"ok", "absent", "noret", "range",
                                             "disp", "obliq", "motion", "sat"};
-        const int i = phase - 5;
+        const int i = phase - 7;
         if (i < 0 || i >= cfg::kTofCount) return true;
 
         const tof::SensorStatus& t = g_tof.status(i);
