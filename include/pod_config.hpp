@@ -43,8 +43,11 @@ constexpr int kRs485RxPin = 18;
 constexpr int kRs485DePin = 7;
 
 
-constexpr int kI2cSdaPin = 16;
-constexpr int kI2cSclPin = 15;
+// Swapped from V1's 16/15, despite the V2 pin table saying unchanged: on the
+// V2 board a TMF8821 ACKs only with SDA on 15. Got wrong, every sensor reads
+// as "no ACK at 0x41", which looks exactly like a dead EN line.
+constexpr int kI2cSdaPin = 15;
+constexpr int kI2cSclPin = 16;
 // Harness order, not numeric order
 // The array is indexed by TofIndex alongside kTofAddrs and kTofMounts
 // the wiring is absorbed here rather than by renumbering the enum.

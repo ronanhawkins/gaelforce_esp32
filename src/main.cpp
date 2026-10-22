@@ -300,15 +300,20 @@ void listen(uint32_t nowMs, int64_t txStartUs, int64_t windowUs) {
     }
 }
 
-// Bench bring-up: print only the encoder, IMU and pose lines. The link, MCL
-// and ToF sections are noise until those parts are wired, and they push the
-// lines you are actually watching off the screen.
-constexpr bool kTelemetryOdomOnly = true;
+// Bench bring-up: print only the short encoder, IMU, pose and ToF lines. The
+// link, MCL and per-sensor diagnostic sections are noise until those parts
+// are wired, and they push the lines you are watching off the screen.
+constexpr bool kTelemetryCompact = true;
 
 // Frame count at the previous IMU line, for a frames/s figure. RVC streams
 // at 100Hz unprompted, so anything far from 100/s is wiring, not motion.
 int64_t g_imuSnapUs = 0;
 uint32_t g_imuSnapFrames = 0;
+
+const char* const kRejectName[] = {"ok", "absent", "noret", "range",
+                                   "disp", "obliq", "motion", "sat"};
+const char* const kTofName[cfg::kTofCount] = {"front", "right", "rear", "left"};
+static_assert(cfg::kTofCount == 4, "telemetry cases 3-6 print one ToF line each");
 
 // ONE SECTION PER TICK. The console blocks and the whole dump is ~1.7kB, which
 // overruns vTaskDelayUntil; the catch-up ticks then hand OdomPoseSource an
@@ -346,9 +351,9 @@ bool telemetrySection(int phase) {
     }
     case 2: {
         const gflib::Pose p = g_odom.getPose();
-        printf("pose x %+7.2f  y %+7.2f  th %+7.2f\n\n", p.x, p.y, p.thetaDeg);
+        printf("pose x %+7.2f  y %+7.2f  th %+7.2f\n", p.x, p.y, p.thetaDeg);
 
-        if (!kTelemetryOdomOnly && g_loop.ticks > 0) {
+        if (!kTelemetryCompact && g_loop.ticks > 0) {
             const double meanPeriodUs = static_cast<double>(g_loop.periodSumUs) / g_loop.ticks;
             ESP_LOGI(kTag, "loop %.2f/%.2f/%.2f ms work %.2f", g_loop.periodMinUs / 1000.0,
                      meanPeriodUs / 1000.0, g_loop.periodMaxUs / 1000.0,
@@ -356,9 +361,31 @@ bool telemetrySection(int phase) {
         }
         // Reset per section, so each window covers only what it reported.
         g_loop.reset();
-        return kTelemetryOdomOnly;
+        break;
     }
-    case 3: {
+    case 3:
+    case 4:
+    case 5:
+    case 6: {
+        // Raw zone ranges, then the median and what the gates made of it.
+        // A zone reading 0 had no target.
+        const int i = phase - 3;
+        const tof::SensorStatus& t = g_tof.status(i);
+        if (!t.present) {
+            printf("tof %-5s ABSENT\n", kTofName[i]);
+        } else if (t.results == 0) {
+            printf("tof %-5s no result yet\n", kTofName[i]);
+        } else {
+            printf("tof %-5s %4u %4u %4u %4u mm %6.2fin %s\n", kTofName[i], t.lastZoneMm[0],
+                   t.lastZoneMm[1], t.lastZoneMm[2], t.lastZoneMm[3],
+                   static_cast<double>(t.lastMedianInches),
+                   kRejectName[static_cast<int>(t.lastReject)]);
+        }
+        if (i < cfg::kTofCount - 1) break;
+        printf("\n");
+        return kTelemetryCompact;
+    }
+    case 7: {
         if (g_rtt.samples > 0) {
             // Air time is exact at this baud and must come off before the
             // remainder is halved
@@ -380,7 +407,7 @@ bool telemetrySection(int phase) {
         g_rtt.reset();
         break;
     }
-    case 4: {
+    case 8: {
         const gflib::LinkStats& s = g_parser.stats();
         ESP_LOGI(kTag,
                  "link crc %" PRIu32 " resync %" PRIu32 " dropped %" PRIu32 " ooo %" PRIu32
@@ -391,7 +418,7 @@ bool telemetrySection(int phase) {
         if (g_droppedSends > 0) ESP_LOGW(kTag, "dropped sends %" PRIu32, g_droppedSends);
         break;
     }
-    case 5: {
+    case 9: {
         // spread is how much the particles agree, NOT how right they are.
         const gflib::Pose m = g_mcl.estimate();
         ESP_LOGI(kTag,
@@ -403,7 +430,7 @@ bool telemetrySection(int phase) {
                  g_mcl.diverged() ? " DIVERGED" : "");
         break;
     }
-    case 6: {
+    case 10: {
         if (g_mclTicks > 0) {
             ESP_LOGI(kTag,
                      "cost mcl %.2f/%.2f ms | tof i2c %.2f/%.2f ms  mean/max over %" PRIu32
@@ -421,9 +448,7 @@ bool telemetrySection(int phase) {
     }
     default: {
         // Per-sensor ToF diagnostics expose mount errors.
-        static const char* kRejectName[] = {"ok", "absent", "noret", "range",
-                                            "disp", "obliq", "motion", "sat"};
-        const int i = phase - 7;
+        const int i = phase - 11;
         if (i < 0 || i >= cfg::kTofCount) return true;
 
         const tof::SensorStatus& t = g_tof.status(i);

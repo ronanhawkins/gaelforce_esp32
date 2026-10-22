@@ -105,16 +105,19 @@ esp_err_t TofArray::begin() {
             esp_err_t e = dev_[i].setSclHz(cfg::kTofRunHz);
             if (e != ESP_OK) return e;
 
-            // The mask must land before spad_map_id selects it, or the part
-            // configures a user-defined map with nothing behind it.
+            e = dev_[i].configure(cfg::kTofPeriodMs, cfg::kTofKiloIterations,
+                                  cfg::kTofSpadMap, 6);
+            if (e != ESP_OK) return e;
+
+            // Only after spad_map_id selects a user-defined map. Before it, the
+            // part ignores the SPAD page and answers 0x0A
+            // (STAT_WARNING_CONFIG_SPAD_1_NOT_ACCEPTED): the preset map in the
+            // common page still owns the array.
             if (cfg::kTofSpadMap >= 14) {
                 e = dev_[i].downloadSpadMask(cfg::kTofSpadMaskBlob,
                                              sizeof(cfg::kTofSpadMaskBlob));
                 if (e != ESP_OK) return e;
             }
-            e = dev_[i].configure(cfg::kTofPeriodMs, cfg::kTofKiloIterations,
-                                  cfg::kTofSpadMap, 6);
-            if (e != ESP_OK) return e;
             return dev_[i].startMeasuring();
         }();
 
