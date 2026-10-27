@@ -14,6 +14,7 @@
 #include "gflib/posesource.hpp"
 #include "hal_esp32.hpp"
 #include "pod_config.hpp"
+#include "status_led.hpp"
 #include "tof_array.hpp"
 
 namespace {
@@ -34,6 +35,8 @@ gflib::OdomPoseSource g_odom(g_vert, g_horiz, g_imu, g_clock, cfg::makeOdom());
 // MCL cloud and correcting sensors.
 gflib::Mcl g_mcl;
 tof::TofArray g_tof;
+
+led::StatusLed g_led;
 
 // State for rate-limited divergence recovery.
 uint32_t g_lastReseedMs = 0;
@@ -487,6 +490,9 @@ extern "C" void app_main(void) {
     // Hold every sensor low before creating the shared I2C bus.
     ESP_ERROR_CHECK(g_tof.holdAllInReset());
 
+    // White through init, so a boot loop shows as constant white.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(g_led.begin(cfg::kStatusLedPin));
+
     g_bootId = bootid::next();
     ESP_LOGI(kTag, "gaelforce pod, bootId %u, link %" PRIu32 " baud", g_bootId,
              gflib::kLinkBaud);
@@ -612,6 +618,18 @@ extern "C" void app_main(void) {
         ++g_mclTicks;
 
         const uint16_t flags = buildFlags(nowMs, confidence);
+
+        led::Inputs li;
+        constexpr uint16_t kSensorsOk = gflib::PoseFlags::kImuOk |
+                                        gflib::PoseFlags::kVertPodOk |
+                                        gflib::PoseFlags::kHorizPodOk;
+        li.sensorFault = (flags & kSensorsOk) != kSensorsOk;
+        li.tofFault = g_tof.presentCount() < cfg::kTofCount;
+        li.linkDown = (flags & gflib::PoseFlags::kLinkDegraded) != 0;
+        li.brainDisabled = gate.brainInhibits;
+        li.poseResetPending = (flags & gflib::PoseFlags::kPoseReset) != 0;
+        li.mclNotConverged = (flags & gflib::PoseFlags::kMclConverged) == 0;
+        g_led.update(nowMs, li);
 
         const int64_t txStartUs = report(nowMs, flags, mclPose, confidence);
 

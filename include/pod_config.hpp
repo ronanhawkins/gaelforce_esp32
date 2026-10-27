@@ -18,12 +18,15 @@ using gflib::operator""_r;
 //
 // Unavailable on this board and deliberately absent below: 0/45/46 strapping,
 // 19/20 USB, 26-32 SPI flash, 33-37 the octal PSRAM die -- the N8R8 module
-// bonds those whether or not the software enables PSRAM -- and 48 the RGB LED.
-// 43/44 are the console UART. That leaves 1-18, 21, 38-42.
+// bonds those whether or not the software enables PSRAM.
+// 43/44 are the console UART. That leaves 1-18, 21, 38-42, and 48 for the LED.
 
 // Quadrature pods, through the SN74LVC245A. The 245 drives actively, so the
 // PCNT channels' default pull-ups are along for the ride and harmless.
 //
+// Onboard WS2812. May need to change to 38 if doesn't work
+constexpr int kStatusLedPin = 48;
+
 constexpr int kVertEncAPin  = 40;
 constexpr int kVertEncBPin  = 39;
 constexpr int kHorizEncAPin = 42;
